@@ -4,3 +4,7 @@ python-dotenv
 fastapi
 uvicorn
 jupyter
+motor
+bcrypt
+pyjwt
+email-validator
