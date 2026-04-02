@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from orchestrator import plan_task, execute_plan
+from orchestrator import plan_task, execute_plan, merge_results
 
 app = FastAPI(
     title="Koala — AI Orchestrator API",
@@ -42,5 +42,8 @@ def breakdown_task(request: PromptRequest):
         # Attach results to each subtask in the response
         for subtask in response["subtasks"]:
             subtask["result"] = results.get(subtask["id"], "(not executed)")
+            
+        final_output = merge_results(request.prompt, plan, results)
+        response["final_output"] = final_output
 
     return response
