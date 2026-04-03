@@ -169,7 +169,7 @@ def execute_plan(plan: OrchestratorPlan, progress_callback=None) -> Dict[int, st
 
         for subtask in list(remaining):
             # Check all dependencies are satisfied
-            if all(dep_id in results for dep_id in subtask.dependencies):
+            if all((dep_id in results for dep_id in subtask.dependencies)):
                 print(f"\n▶ [{subtask.id}] 🤖 {subtask.assigned_model} | {subtask.description}")
                 print("   Working...")
 

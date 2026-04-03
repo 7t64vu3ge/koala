@@ -3,7 +3,7 @@ import jwt
 from datetime import datetime, timedelta
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
-from database import db
+from .database import db
 from bson import ObjectId
 import bcrypt
 

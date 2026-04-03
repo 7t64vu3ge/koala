@@ -1,9 +1,9 @@
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from database import db
-from models import UserSignup, UserSignin, UserSettings, UserResponse, Token, MessageCreate, ChatSessionResponse
-from auth import get_password_hash, verify_password, create_access_token, get_current_user
-from orchestrator import plan_task, execute_plan, merge_results
+from .database import db
+from .models import UserSignup, UserSignin, UserSettings, UserResponse, Token, MessageCreate, ChatSessionResponse
+from .auth import get_password_hash, verify_password, create_access_token, get_current_user
+from .orchestrator import plan_task, execute_plan, merge_results
 from bson import ObjectId
 from datetime import datetime
 
