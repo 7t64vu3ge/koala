@@ -1,7 +1,9 @@
 import React, { useState } from 'react';
+import { X } from 'lucide-react';
 import { useAuth } from '../AuthContext';
+import { API_BASE_URL } from '../constants';
 
-export default function Settings() {
+export default function Settings({ onClose }) {
   const { user, token, updateUserSettings } = useAuth();
   const [displayName, setDisplayName] = useState(user.display_name || '');
   const [theme, setLocalTheme] = useState(user.theme || 'dark');
@@ -11,7 +13,7 @@ export default function Settings() {
     e.preventDefault();
     setMessage('');
     try {
-      const res = await fetch('http://localhost:8000/users/settings', {
+      const res = await fetch(`${API_BASE_URL}/users/settings`, {
         method: 'PUT',
         headers: {
           'Content-Type': 'application/json',
@@ -33,7 +35,7 @@ export default function Settings() {
   const handleClearHistory = async () => {
     if (!window.confirm("Are you sure you want to clear all chat sessions?")) return;
     try {
-      const res = await fetch('http://localhost:8000/chat/sessions', {
+      const res = await fetch(`${API_BASE_URL}/chat/sessions`, {
         method: 'DELETE',
         headers: { 'Authorization': `Bearer ${token}` }
       });
@@ -46,52 +48,63 @@ export default function Settings() {
   };
 
   return (
-    <div className="settings-container">
-      <h1 style={{fontSize: '2rem', fontWeight: 'bold'}}>Settings</h1>
-      
-      {message && <div style={{padding: '1rem', backgroundColor: 'var(--bg-surface)', borderRadius: '0.5rem', borderLeft: '4px solid var(--accent-color)'}}>{message}</div>}
+    <>
+      {onClose && (
+        <button onClick={onClose} className="modal-close-btn" title="Close">
+          <X size={20} />
+        </button>
+      )}
+      <div className="settings-container">
+        <h1 style={{ fontSize: '1.75rem', fontWeight: 'bold', marginBottom: '1.5rem' }}>Settings</h1>
+
+      {message && (
+        <div style={{ padding: '1rem', backgroundColor: 'var(--bg-surface)', borderRadius: '0.5rem', borderLeft: '4px solid var(--accent-color)', marginBottom: '1.5rem' }}>
+          {message}
+        </div>
+      )}
 
       <form onSubmit={handleSave} className="settings-section">
         <h2>Profile & Preferences</h2>
-        
+
         <div>
-          <label style={{display: 'block', marginBottom: '0.5rem'}}>Display Name</label>
-          <input 
-            type="text" 
-            className="input" 
-            value={displayName} 
-            onChange={e => setDisplayName(e.target.value)} 
+          <label style={{ display: 'block', marginBottom: '0.5rem' }}>Display Name</label>
+          <input
+            type="text"
+            className="input"
+            value={displayName}
+            onChange={e => setDisplayName(e.target.value)}
           />
         </div>
 
         <div>
-           <label style={{display: 'block', marginBottom: '0.5rem'}}>Theme</label>
-           <select 
-             className="input" 
-             value={theme}
-             onChange={e => setLocalTheme(e.target.value)}
-           >
-             <option value="dark">Dark Mode</option>
-             <option value="light">Light Mode</option>
-           </select>
+          <label style={{ display: 'block', marginBottom: '0.5rem' }}>Theme</label>
+          <select
+            className="input"
+            value={theme}
+            onChange={e => setLocalTheme(e.target.value)}
+          >
+            <option value="dark">Dark Mode</option>
+            <option value="light">Light Mode</option>
+          </select>
         </div>
 
-        <div style={{marginTop: '1rem'}}>
+        <div style={{ marginTop: '1rem' }}>
           <button type="submit" className="btn btn-primary">Save Settings</button>
         </div>
       </form>
 
       <div className="settings-section">
         <h2>Data Management</h2>
-        <p style={{color: 'var(--text-secondary)', marginBottom: '1rem', lineHeight: '1.5'}}>
+        <p style={{ color: 'var(--text-secondary)', marginBottom: '1rem', lineHeight: '1.5', fontSize: '0.9rem' }}>
           Clearing history will permanently delete all your conversation data. This action cannot be undone.
         </p>
         <div>
-          <button onClick={handleClearHistory} className="btn" style={{backgroundColor: 'rgba(239, 68, 68, 0.1)', color: 'var(--error-color)', border: '1px solid rgba(239, 68, 68, 0.2)'}}>
+          <button onClick={handleClearHistory} className="btn" style={{ backgroundColor: 'rgba(239, 68, 68, 0.1)', color: 'var(--error-color)', border: '1px solid rgba(239, 68, 68, 0.2)', padding: '0.5rem 1rem' }}>
             Clear All History
           </button>
         </div>
       </div>
     </div>
+    </>
   );
 }

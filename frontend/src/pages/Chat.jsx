@@ -1,16 +1,25 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Send, Bot } from 'lucide-react';
 import { useAuth } from '../AuthContext';
+import { useChat } from '../ChatContext';
+import { API_BASE_URL } from '../constants';
 
 export default function Chat() {
   const { user, token } = useAuth();
+  const { currentSessionId, sessions, loadingSessions, persistNewSession, setCurrentSessionId, refreshSessions } = useChat();
   const [messages, setMessages] = useState([]);
-  const [sessionId, setSessionId] = useState(null);
-  const [sessionLoading, setSessionLoading] = useState(true);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
   const scrollRef = useRef(null);
   const inputRef = useRef(null);
+  const [expandedMessages, setExpandedMessages] = useState({});
+
+  const toggleDetails = (idx) => {
+    setExpandedMessages(prev => ({
+      ...prev,
+      [idx]: !prev[idx]
+    }));
+  };
 
   // Time based greeting
   const getGreeting = () => {
@@ -27,59 +36,92 @@ export default function Chat() {
   }, [messages, loading]);
 
   useEffect(() => {
-    const fetchSession = async () => {
-      setSessionLoading(true);
-      try {
-        const res = await fetch('http://localhost:8000/chat/sessions', {
-          headers: { 'Authorization': `Bearer ${token}` }
-        });
-        
-        if (!res.ok) throw new Error('Failed to fetch sessions');
-        const sessions = await res.json();
-        
-        if (Array.isArray(sessions) && sessions.length > 0) {
-          setSessionId(sessions[0].id);
-          setMessages(sessions[0].messages || []);
-        } else {
-          const createRes = await fetch('http://localhost:8000/chat/sessions', {
-            method: 'POST',
-            headers: { 'Authorization': `Bearer ${token}` }
-          });
-          const newSession = await createRes.json();
-          setSessionId(newSession.id);
+    // Only sync if we aren't currently waiting for a response (loading)
+    // to prevent local optimistic messages from being cleared
+    if (!loading) {
+      if (currentSessionId && sessions.length > 0) {
+        const current = sessions.find(s => s.id === currentSessionId);
+        if (current) {
+          setMessages(current.messages || []);
         }
-      } catch (err) {
-        console.error('Session error:', err);
-      } finally {
-        setSessionLoading(false);
+      } else if (currentSessionId === null) {
+        setMessages([]);
       }
-    };
-    if (token) fetchSession();
-  }, [token]);
+    }
+  }, [currentSessionId, sessions, loading]);
+
+  // Auto-focus input and resize
+  useEffect(() => {
+    if (inputRef.current) {
+      inputRef.current.style.height = 'auto';
+      inputRef.current.style.height = `${inputRef.current.scrollHeight}px`;
+    }
+  }, [input]);
 
   const handleSubmit = async (e) => {
     if (e) e.preventDefault();
-    if (!input.trim() || !sessionId || loading) return;
+    if (!input.trim() || loading) return;
     
     const userMsg = input;
     setInput('');
+    // Optimistic update
     setMessages(prev => [...prev, { role: 'user', content: userMsg }]);
     setLoading(true);
 
     try {
-      const res = await fetch(`http://localhost:8000/chat/sessions/${sessionId}/messages`, {
+      let activeSessionId = currentSessionId;
+      
+      // If in New Chat mode, persist to DB now
+      if (!activeSessionId) {
+        const newSession = await persistNewSession();
+        if (newSession) {
+          activeSessionId = newSession.id;
+        } else {
+          throw new Error("Failed to persist session");
+        }
+      }
+
+      const res = await fetch(`${API_BASE_URL}/chat/sessions/${activeSessionId}/messages`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${token}`
         },
-        body: JSON.stringify({ content: userMsg, execute: true })
+        body: JSON.stringify({ content: userMsg, execute: false })
       });
       
       const sessionOut = await res.json();
+      
+      if (activeSessionId === "new") {
+        setCurrentSessionId(sessionOut.id);
+        refreshSessions();
+      }
+      
       setMessages(sessionOut.messages);
+      
     } catch (err) {
       console.error(err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleExecutePlan = async (msgIndex) => {
+    setLoading(true);
+    try {
+      const res = await fetch(`${API_BASE_URL}/chat/sessions/${currentSessionId}/messages/${msgIndex}/execute`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${token}`
+        }
+      });
+      if (res.ok) {
+        const sessionOut = await res.json();
+        setMessages(sessionOut.messages);
+        refreshSessions();
+      }
+    } catch (err) {
+      console.error("Execution failed:", err);
     } finally {
       setLoading(false);
     }
@@ -104,30 +146,66 @@ export default function Chat() {
           </div>
         ) : (
           messages.map((msg, idx) => (
-            <div key={idx} className={`message ${msg.role}`}>
-              <div className="message-avatar">
-                {msg.role === 'user' ? user?.display_name?.charAt(0).toUpperCase() : <Bot size={20} />}
-              </div>
-              <div className="message-content">
-                <div style={{fontWeight: 600, marginBottom: '0.25rem', color: msg.role === 'user' ? 'var(--text-primary)' : 'var(--accent-color)'}}>
+            <div key={idx} className={`message-wrapper ${msg.role}`}>
+              <div className={`message-bubble ${msg.role}`}>
+                <div className="message-header">
                   {msg.role === 'user' ? 'You' : 'Koala'}
                 </div>
-                <div style={{whiteSpace: 'pre-wrap'}}>{msg.content}</div>
+                <div className="message-content">{msg.content}</div>
                 
                 {msg.subtasks && msg.subtasks.length > 0 && (
-                  <div style={{marginTop: '1.5rem', display: 'flex', flexDirection: 'column', gap: '0.75rem'}}>
-                    <div style={{fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.05em', color: 'var(--text-secondary)'}}>
-                      Execution Plan
-                    </div>
-                    {msg.subtasks.map((task, tidx) => (
-                      <div key={tidx} className="subtask-box">
-                        <div className="subtask-header">{task.id} — Assigned to: <span style={{color: 'var(--accent-color)'}}>{task.assigned_model}</span></div>
-                        <div style={{color: 'var(--text-secondary)', fontSize: '0.85rem', marginBottom: '0.5rem'}}>{task.description}</div>
-                        <div style={{fontSize: '0.85rem', padding: '0.5rem', backgroundColor: 'rgba(0,0,0,0.2)', borderRadius: '0.25rem', borderLeft: '3px solid var(--accent-color)'}}>
-                          <strong>Result:</strong> {task.result || 'Pending / Not Executed'}
+                  <div className="orchestration-section">
+                    <button 
+                      className="details-toggle-btn"
+                      onClick={() => toggleDetails(idx)}
+                    >
+                      {expandedMessages[idx] ? 'Hide Orchestration Details' : 'Show Orchestration Details'}
+                    </button>
+                    
+                    {expandedMessages[idx] && (
+                      <div className="subtasks-container">
+                        <div className="subtasks-label">
+                          {msg.status === 'pending_approval' ? 'Proposed Execution Plan:' : 'Orchestration Workflow:'}
                         </div>
+                        {msg.subtasks.map((task, tidx) => (
+                          <div key={tidx} className="subtask-card">
+                            <div className="subtask-card-header">
+                              <span className={`status-dot ${task.result ? 'done' : (msg.status === 'executing' ? 'active' : 'idle')}`}></span>
+                              <strong>Step {task.id}</strong> — <span className="model-tag">{task.assigned_model}</span>
+                            </div>
+                            <div className="subtask-desc">{task.description}</div>
+                            {task.result && (
+                              <div className="subtask-result">
+                                <div className="result-label">Result:</div>
+                                <div className="result-text">{task.result}</div>
+                              </div>
+                            )}
+                          </div>
+                        ))}
                       </div>
-                    ))}
+                    )}
+                  </div>
+                )}
+
+                {msg.role === 'assistant' && ['pending_approval', 'error'].includes(msg.status) && (
+                  <div className="plan-approval-actions">
+                    <button 
+                      className="execute-btn" 
+                      onClick={() => handleExecutePlan(idx)}
+                      disabled={loading}
+                    >
+                      {loading ? 'Wait...' : 'Confirm & Execute Orchestration'}
+                    </button>
+                    <div className="refine-tip">
+                      Or type your feedback below to refine this plan...
+                    </div>
+                  </div>
+                )}
+
+                {msg.status === 'executing' && (
+                  <div className="distributing-status">
+                    <div className="pulse-loader"></div>
+                    Agents are distributed and working on subtasks...
                   </div>
                 )}
               </div>
@@ -135,25 +213,16 @@ export default function Chat() {
           ))
         )}
         
-        {loading && (
-          <div className="message assistant">
-            <div className="message-avatar"><Bot size={20} /></div>
-            <div className="message-content">
-              <div style={{fontWeight: 600, marginBottom: '0.25rem', color: 'var(--accent-color)'}}>Koala</div>
-              <div style={{display: 'flex', gap: '0.5rem', alignItems: 'center', margin: '0.5rem 0'}}>
-                <span style={{display: 'inline-block', width: '8px', height: '8px', borderRadius: '50%', backgroundColor: 'var(--text-secondary)', animation: 'pulse 1.5s infinite'}}></span>
-                <span style={{display: 'inline-block', width: '8px', height: '8px', borderRadius: '50%', backgroundColor: 'var(--text-secondary)', animation: 'pulse 1.5s infinite', animationDelay: '0.2s'}}></span>
-                <span style={{display: 'inline-block', width: '8px', height: '8px', borderRadius: '50%', backgroundColor: 'var(--text-secondary)', animation: 'pulse 1.5s infinite', animationDelay: '0.4s'}}></span>
+        {loading && !messages.some(m => m.status === 'executing') && (
+          <div className="message-wrapper assistant">
+            <div className="message-bubble assistant">
+              <div className="loading-dots">
+                <span></span><span></span><span></span>
               </div>
             </div>
-            <style dangerouslySetInnerHTML={{__html: `
-              @keyframes pulse {
-                0%, 100% { opacity: 0.4; transform: scale(0.8); }
-                50% { opacity: 1; transform: scale(1); }
-              }
-            `}} />
           </div>
         )}
+        <div ref={scrollRef} style={{ height: '1px' }} />
       </div>
 
       <div className="fixed-input-container glass">
@@ -161,18 +230,18 @@ export default function Chat() {
           <textarea
             ref={inputRef}
             className="chat-input"
-            placeholder={sessionLoading ? "Initializing session..." : "Type your orchestration prompt..."}
+            placeholder={loadingSessions ? "Initializing..." : "Type your orchestration prompt..."}
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={handleKeyDown}
-            disabled={sessionLoading || loading}
+            disabled={loading}
             rows={1}
             style={{paddingRight: '3.5rem', width: '100%'}}
           />
           <button 
             className="send-btn" 
             onClick={handleSubmit} 
-            disabled={!input.trim() || loading || sessionLoading}
+            disabled={!input.trim() || loading}
             type="button"
           >
             <Send size={18} />

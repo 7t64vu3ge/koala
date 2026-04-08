@@ -1,18 +1,24 @@
 import os
 import json
-from typing import List, Literal, Dict
+from typing import List, Literal, Dict, Any
 from dotenv import load_dotenv
-from groq import Groq
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+from langchain_groq import ChatGroq
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 
 # Load API keys
 load_dotenv()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# ── Groq client (used for planning + execution) ───────────────────────
-groq_client = None
+# ── LangChain Chat Model ───────────────────────
+chat_model = None
 if GROQ_API_KEY and "your_" not in GROQ_API_KEY:
-    groq_client = Groq(api_key=GROQ_API_KEY)
+    chat_model = ChatGroq(
+        api_key=GROQ_API_KEY,
+        model_name="llama-3.3-70b-versatile", # default model
+        temperature=0.7,
+        max_retries=2,
+    )
 
 
 # ── Pydantic models ──────────────────────────────────────────────────────────
@@ -23,17 +29,30 @@ class Subtask(BaseModel):
     assigned_model: Literal[
         "llama-3.1-8b-instant",
         "llama-3.3-70b-versatile",
-        "openai/gpt-oss-120b",
-        "openai/gpt-oss-20b",
-        "whisper-large-v3",
-        "whisper-large-v3-turbo"
+        "llama-3.1-70b-versatile",
+        "distil-whisper-large-v3-en"
     ] = Field(
-        description="Assigned AI model for this task. "
-                    "Use 'llama-3.1-8b-instant' or 'llama-3.3-70b-versatile' for standard logical reasoning. "
-                    "Use 'openai/gpt-oss-120b' or 'openai/gpt-oss-20b' for highly demanding and creative coding tasks. "
-                    "Use 'whisper-large-v3' or 'whisper-large-v3-turbo' only if audio transcription processing conceptually applies."
+        description="Assigned free AI model for this task. "
+                    "Use 'llama-3.3-70b-versatile' for complex logical reasoning and coding. "
+                    "Use 'llama-3.1-8b-instant' for fast, simple feedback or translations. "
+                    "Use 'llama-3.1-70b-versatile' for alternative high-context reasoning. "
+                    "Use 'distil-whisper-large-v3-en' only if audio transcription processing conceptually applies."
     )
     dependencies: List[int] = Field(description="List of IDs of subtasks that must be completed before this one")
+
+    @field_validator("assigned_model", mode="before")
+    @classmethod
+    def map_deprecated_models(cls, v: Any) -> str:
+        # Robustly map hallucinations or deprecated models to the current free tier
+        MAPPING = {
+            "mixtral-8x7b-32768": "llama-3.1-70b-versatile",
+            "llama-3.1-70b-instant": "llama-3.1-8b-instant",
+            "whisper-large-v3": "llama-3.3-70b-versatile", # Fallback for mis-assignments
+            "whisper-large-v3-turbo": "llama-3.3-70b-versatile",
+            "openai/gpt-oss-120b": "llama-3.3-70b-versatile",
+            "openai/gpt-oss-20b": "llama-3.1-70b-versatile"
+        }
+        return MAPPING.get(v, v)
 
 class OrchestratorPlan(BaseModel):
     plan_summary: str = Field(description="A brief summary of the overall plan")
@@ -42,23 +61,30 @@ class OrchestratorPlan(BaseModel):
 
 # ── Planning ─────────────────────────────────────────────────────────────────
 
-def plan_task(prompt: str) -> OrchestratorPlan | None:
-    """Uses Groq to decompose a user prompt into an ordered subtask plan."""
-    if not groq_client:
-        print("⚠️  Please configure your GROQ_API_KEY in the .env file.")
+def plan_task(prompt: str, history: List[Dict] = None, metadata: Dict = None) -> OrchestratorPlan | None:
+    """Uses LangChain to decompose a prompt into a subtask plan with session context."""
+    if not chat_model:
+        print("⚠️  Chat model not configured.")
         return None
 
-    system_instruction = '''
-    You are an AI Orchestrator. Your job is to take a complex user request 
-(such as a web dev project or a research request) and break it down into a logical 
-sequence of actionable subtasks.
+    metadata = metadata or {}
+    user_name = metadata.get("user_name", "User")
+    topic = metadata.get("topic", "General Discussion")
+
+    system_instruction = f'''
+    You are an AI Orchestrator. Your job is to take a request from {user_name} 
+    regarding the topic: '{topic}' and break it down into actionable subtasks.
+    
+    Maintain the existing context and optimize for the user's ultimate goal.
 
 For each subtask:
 1. Clearly describe the task.
-2. Assign the most appropriate AI model from the available options:
-   - 'llama-3.1-8b-instant', 'llama-3.3-70b-versatile': Good for logic and reasoning.
-   - 'openai/gpt-oss-120b', 'openai/gpt-oss-20b': Best for deep coding and complex creative workloads.
-   - 'whisper-large-v3', 'whisper-large-v3-turbo': For audio processing/transcription.
+2. Assign the most appropriate free AI model from the available options (STRICTLY USE ONLY THESE IDs):
+   - 'llama-3.3-70b-versatile': Best for complex logic, multi-step reasoning, and deep coding.
+   - 'llama-3.1-8b-instant', 'llama-3.1-70b-versatile': Good for general tasks and context-heavy logic.
+   - 'distil-whisper-large-v3-en': For audio-related tasks.
+
+   DO NOT use deprecated models like 'mixtral-8x7b-32768'.
 
 3. Provide a detailed evaluation including:
    - Why this model is selected over others
@@ -84,29 +110,83 @@ After completing all subtasks:
 Return the output as a structured JSON object according to the requested schema.
     '''
 
-    print(f"\n🔍 Orchestrating task: '{prompt}'...")
-    print("🤔 Thinking...")
+    try:
+        schema = OrchestratorPlan.model_json_schema()
+        messages = [
+            SystemMessage(content=f"{system_instruction}\n\nYou MUST return a valid JSON object strictly matching this schema:\n{json.dumps(schema)}"),
+        ]
+        
+        # Convert raw history to LangChain messages
+        for msg in (history or []):
+            if msg["role"] == "user":
+                messages.append(HumanMessage(content=msg["content"]))
+            elif msg["role"] == "assistant":
+                messages.append(AIMessage(content=msg["content"]))
+        
+        messages.append(HumanMessage(content=prompt))
+
+        response = chat_model.with_structured_output(OrchestratorPlan).invoke(messages)
+        return response
+    except Exception as e:
+        print(f"❌ Error during orchestration: {e}")
+        return None
+
+
+def generate_chat_title(prompt: str) -> str:
+    """Uses LangChain to generate a concise 3-5 word title for a chat session."""
+    if not chat_model:
+        return "New Chat"
+    
+    system_instruction = "You are a helpful assistant that generates a concise, 3-5 word title for a chat session based on the user's first message. Respond ONLY with the title text, no quotes or extra characters."
+    
+    try:
+        response = chat_model.invoke([
+            SystemMessage(content=system_instruction),
+            HumanMessage(content=prompt)
+        ])
+        return response.content.strip().strip('"').strip("'")
+    except Exception as e:
+        print(f"❌ Error generating title: {e}")
+        return "New Chat"
+
+
+def refine_plan(original_prompt: str, current_plan: OrchestratorPlan, feedback: str, history: List[Dict] = None, metadata: Dict = None) -> OrchestratorPlan | None:
+    """Uses LangChain to refine an existing plan based on feedback and history."""
+    if not chat_model:
+        return None
+
+    metadata = metadata or {}
+    user_name = metadata.get("user_name", "User")
+    topic = metadata.get("topic", "General Discussion")
+
+    system_instruction = f'''
+    You are an AI Orchestrator working with {user_name} on '{topic}'.
+    A user has provided feedback on a plan you generated.
+    
+    ORIGINAL GOAL: {original_prompt}
+    CURRENT PLAN: {current_plan.model_dump_json()}
+    
+    Your job is to update the subtasks to incorporate this feedback.
+    '''
 
     try:
         schema = OrchestratorPlan.model_json_schema()
-        response = groq_client.chat.completions.create(
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        f"{system_instruction}\n\n"
-                        f"You MUST return a valid JSON object strictly matching this schema:\n{json.dumps(schema)}"
-                    )
-                },
-                {"role": "user", "content": prompt}
-            ],
-            model="llama-3.3-70b-versatile",
-            response_format={"type": "json_object"}
-        )
-        plan_data = json.loads(response.choices[0].message.content)
-        return OrchestratorPlan(**plan_data)
+        messages = [
+            SystemMessage(content=f"{system_instruction}\n\nYou MUST return a valid JSON object strictly matching this schema:\n{json.dumps(schema)}"),
+        ]
+        
+        for msg in (history or []):
+            if msg["role"] == "user":
+                messages.append(HumanMessage(content=msg["content"]))
+            elif msg["role"] == "assistant":
+                messages.append(AIMessage(content=msg["content"]))
+                
+        messages.append(HumanMessage(content=f"Refine the plan based on my feedback: {feedback}"))
+
+        response = chat_model.with_structured_output(OrchestratorPlan).invoke(messages)
+        return response
     except Exception as e:
-        print(f"❌ Error during orchestration: {e}")
+        print(f"❌ Error during plan refinement: {e}")
         return None
 
 
@@ -133,15 +213,15 @@ def _build_context_prompt(subtask: Subtask, completed_results: Dict[int, str]) -
 
 
 def _execute_with_model(prompt: str, model: str) -> str:
-    """Sends a prompt using the configured Groq client to the specified model."""
-    if not groq_client:
-        return "⚠️  GROQ_API_KEY not configured — skipping execution."
+    """Sends a prompt Using LangChain for cleaner subtask execution."""
+    if not chat_model:
+        return "⚠️  Chat model not configured."
+        
     try:
-        response = groq_client.chat.completions.create(
-            messages=[{"role": "user", "content": prompt}],
-            model=model,
-        )
-        return response.choices[0].message.content.strip()
+        # Use simple invoke for raw text generation in execution steps
+        # This keeps the model instance shared for better rate limit handling
+        response = chat_model.invoke([HumanMessage(content=prompt)])
+        return response.content.strip()
     except Exception as e:
         return f"❌ Execution error with {model}: {e}"
 
@@ -197,8 +277,8 @@ def execute_plan(plan: OrchestratorPlan, progress_callback=None) -> Dict[int, st
 
 def merge_results(original_prompt: str, plan: OrchestratorPlan, execution_results: Dict[int, str]) -> str:
     """Takes the original prompt, the generated plan, and all subtask results to produce a final cohesive output."""
-    if not groq_client:
-        return "⚠️  GROQ_API_KEY not configured — skipping merge."
+    if not chat_model:
+        return "⚠️  Chat model not configured."
         
     print("\n" + "=" * 50)
     print("🧠 MERGING RESULTS")
@@ -212,30 +292,25 @@ def merge_results(original_prompt: str, plan: OrchestratorPlan, execution_result
         
     context_block = "\n\n".join(context_parts)
     
-    system_instruction = (
-        "You are an expert AI Synthesizer. Your job is to read a user's original goal, "
-        "the subtasks that were planned to achieve this goal, and the actual raw output from those subtasks. "
-        "You must merge, refine, and format this information into a single, cohesive, and comprehensive final response "
-        "that perfectly satisfies the user's original request. Do not just blindly copy the subtask results; "
-        "synthesize them naturally into a final polished artifact or answer."
-    )
-    
-    prompt = (
-        f"USER'S ORIGINAL REQUEST: {original_prompt}\n\n"
-        f"PLAN SUMMARY: {plan.plan_summary}\n\n"
-        f"SUBTASK RESULTS:\n{context_block}\n\n"
-        "Now, please synthesize the final response based on the above information."
-    )
-    
     try:
-        response = groq_client.chat.completions.create(
-            messages=[
-                {"role": "system", "content": system_instruction},
-                {"role": "user", "content": prompt}
-            ],
-            model="llama-3.3-70b-versatile",
+        system_instruction = (
+            "You are an expert AI Synthesizer. Your job is to read a user's original goal, "
+            "the subtasks that were planned to achieve this goal, and the actual raw output from those subtasks. "
+            "synthesize them naturally into a final polished artifact or answer."
         )
-        return response.choices[0].message.content.strip()
+        
+        prompt_block = (
+            f"USER'S ORIGINAL REQUEST: {original_prompt}\n\n"
+            f"PLAN SUMMARY: {plan.plan_summary}\n\n"
+            f"SUBTASK RESULTS:\n{context_block}\n\n"
+            "Now, please synthesize the final response based on the above information."
+        )
+
+        response = chat_model.invoke([
+            SystemMessage(content=system_instruction),
+            HumanMessage(content=prompt_block)
+        ])
+        return response.content.strip()
     except Exception as e:
         print(f"❌ Error during merge: {e}")
         return f"❌ Error during merge: {e}"
@@ -248,7 +323,7 @@ def main():
     print("  🐨 Koala — Terminal AI Orchestrator")
     print("=" * 50)
     print("Breaks down complex tasks and executes them via specialized AI models.\n")
-    print(f"  Planner & Executor Client: {'✅ ready' if groq_client else '❌ not configured'}")
+    print(f"  Planner & Executor Client: {'✅ ready' if chat_model else '❌ not configured'}")
     print()
 
     while True:

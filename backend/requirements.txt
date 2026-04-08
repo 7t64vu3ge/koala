@@ -8,3 +8,5 @@ motor
 bcrypt
 pyjwt
 email-validator
+langchain
+langchain-groq

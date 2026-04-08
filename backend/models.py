@@ -28,11 +28,14 @@ class Token(BaseModel):
 class MessageBase(BaseModel):
     role: str
     content: str
+    status: str = "completed" # "completed", "pending_approval", "executing"
     subtasks: Optional[List[Dict[str, Any]]] = None
+    plan: Optional[Dict[str, Any]] = None # stores the raw OrchestratorPlan data
 
 class MessageCreate(BaseModel):
     content: str
     execute: bool = False
+    parent_message_id: Optional[str] = None # For refinements
 
 class ChatSessionResponse(BaseModel):
     id: str

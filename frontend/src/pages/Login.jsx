@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
 import { useAuth } from '../AuthContext';
+import { API_BASE_URL } from '../constants';
 
 export default function Login() {
   const { login } = useAuth();
@@ -13,7 +14,7 @@ export default function Login() {
     e.preventDefault();
     setError(null);
     try {
-      const res = await fetch('http://localhost:8000/auth/signin', {
+      const res = await fetch(`${API_BASE_URL}/auth/signin`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
