@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from database import db
 from models import UserSignup, UserSignin, UserSettings, UserResponse, Token, MessageCreate, ChatSessionResponse
 from auth import get_password_hash, verify_password, create_access_token, get_current_user
-from orchestrator import plan_task, execute_plan, merge_results, generate_chat_title, refine_plan, OrchestratorPlan
+from orchestrator import plan_task, merge_results, generate_chat_title, refine_plan, OrchestratorPlan, orchestration_graph, OrchestrationState
 from bson import ObjectId
 from datetime import datetime
 
@@ -248,19 +248,40 @@ async def execute_confirmed_plan(session_id: str, message_index: int, current_us
                 original_prompt = messages[i]["content"]
                 break
         
-        print(f"🚀 Execution started for prompt: {original_prompt[:50]}...")
+        # Build history for context-aware synthesis
+        history = []
+        for m in session.get("messages", [])[:message_index]:
+            if m.get("status") == "completed":
+                history.append({"role": m["role"], "content": m["content"]})
+
+        print(f"🚀 Graph Execution started for prompt: {original_prompt[:50]}...")
         
-        # Execute the plan
-        results = execute_plan(plan)
+        # Initialize Graph State
+        initial_state = {
+            "original_prompt": original_prompt,
+            "metadata": session.get("metadata", {}),
+            "history": history, # History built in send_message, but let's just use current session logic
+            "plan": plan,
+            "completed_results": {},
+            "next_subtask_id": -1,
+            "final_output": "",
+            "error": ""
+        }
         
-        # Update subtasks with results
+        # Execute the Graph
+        final_state = orchestration_graph.invoke(initial_state)
+        
+        if final_state.get("error"):
+            raise Exception(final_state["error"])
+            
+        results = final_state["completed_results"]
+        final_output = final_state["final_output"]
+        
+        # Update subtasks with results for UI feedback
         updated_subtasks = plan_msg["subtasks"]
         for st in updated_subtasks:
             st["result"] = results.get(st["id"], "(not executed)")
             
-        # Final synthesis
-        final_output = merge_results(original_prompt, plan, results)
-        
         # Atomically update the message to completed
         await db.chat_sessions.update_one(
             {"_id": db_session_id},

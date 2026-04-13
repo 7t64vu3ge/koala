@@ -1,6 +1,6 @@
 import os
 import jwt
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from database import db
@@ -9,7 +9,8 @@ import bcrypt
 
 SECRET_KEY = os.getenv("SECRET_KEY", "super-secret-koala-key")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7 # 1 week
+# Extended expiration to 30 days for better UX
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 30 
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/signin")
 
@@ -21,9 +22,11 @@ def get_password_hash(password: str):
 
 def create_access_token(data: dict):
     to_encode = data.copy()
-    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    # Using modern timezone-aware UTC
+    expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    print(f"🔑 Token generated for user {data.get('sub')} - Expires at: {expire}")
     return encoded_jwt
 
 async def get_current_user(token: str = Depends(oauth2_scheme)):

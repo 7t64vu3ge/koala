@@ -3,25 +3,20 @@ import { Send, Bot } from 'lucide-react';
 import { useAuth } from '../AuthContext';
 import { useChat } from '../ChatContext';
 import { API_BASE_URL } from '../constants';
+import MessageBubble from '../components/MessageBubble';
 
 export default function Chat() {
   const { user, token } = useAuth();
   const { currentSessionId, sessions, loadingSessions, persistNewSession, setCurrentSessionId, refreshSessions } = useChat();
+  const currentSession = sessions.find(s => s.id === currentSessionId);
+  const topic = currentSession?.metadata?.topic || currentSession?.title || "New Orchestration";
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
   const scrollRef = useRef(null);
   const inputRef = useRef(null);
-  const [expandedMessages, setExpandedMessages] = useState({});
 
-  const toggleDetails = (idx) => {
-    setExpandedMessages(prev => ({
-      ...prev,
-      [idx]: !prev[idx]
-    }));
-  };
-
-  // Time based greeting
+  // Greeting logic and effect hooks...
   const getGreeting = () => {
     const hour = new Date().getHours();
     if (hour < 12) return `Good Morning, ${user?.display_name}`;
@@ -36,13 +31,17 @@ export default function Chat() {
   }, [messages, loading]);
 
   useEffect(() => {
-    // Only sync if we aren't currently waiting for a response (loading)
-    // to prevent local optimistic messages from being cleared
+    // Sync local message state with context data
+    // but only if we are not in a loading/sending state to avoid race conditions
     if (!loading) {
       if (currentSessionId && sessions.length > 0) {
         const current = sessions.find(s => s.id === currentSessionId);
         if (current) {
-          setMessages(current.messages || []);
+          // Optimization: Only update if the content has actually changed
+          // to prevent unnecessary re-renders or cursor jumps
+          if (JSON.stringify(current.messages) !== JSON.stringify(messages)) {
+            setMessages(current.messages || []);
+          }
         }
       } else if (currentSessionId === null) {
         setMessages([]);
@@ -50,7 +49,6 @@ export default function Chat() {
     }
   }, [currentSessionId, sessions, loading]);
 
-  // Auto-focus input and resize
   useEffect(() => {
     if (inputRef.current) {
       inputRef.current.style.height = 'auto';
@@ -64,21 +62,15 @@ export default function Chat() {
     
     const userMsg = input;
     setInput('');
-    // Optimistic update
     setMessages(prev => [...prev, { role: 'user', content: userMsg }]);
     setLoading(true);
 
     try {
       let activeSessionId = currentSessionId;
-      
-      // If in New Chat mode, persist to DB now
       if (!activeSessionId) {
         const newSession = await persistNewSession();
-        if (newSession) {
-          activeSessionId = newSession.id;
-        } else {
-          throw new Error("Failed to persist session");
-        }
+        if (newSession) activeSessionId = newSession.id;
+        else throw new Error("Failed to persist session");
       }
 
       const res = await fetch(`${API_BASE_URL}/chat/sessions/${activeSessionId}/messages`, {
@@ -91,13 +83,10 @@ export default function Chat() {
       });
       
       const sessionOut = await res.json();
-      
-      if (activeSessionId === "new") {
-        setCurrentSessionId(sessionOut.id);
-        refreshSessions();
-      }
+      if (currentSessionId === null) setCurrentSessionId(sessionOut.id);
       
       setMessages(sessionOut.messages);
+      await refreshSessions();
       
     } catch (err) {
       console.error(err);
@@ -107,7 +96,8 @@ export default function Chat() {
   };
 
   const handleExecutePlan = async (msgIndex) => {
-    setLoading(true);
+    // Note: MessengerBubble handles its own localLoading, but we still use global loading
+    // to potentially disable other inputs if needed.
     try {
       const res = await fetch(`${API_BASE_URL}/chat/sessions/${currentSessionId}/messages/${msgIndex}/execute`, {
         method: 'POST',
@@ -118,12 +108,10 @@ export default function Chat() {
       if (res.ok) {
         const sessionOut = await res.json();
         setMessages(sessionOut.messages);
-        refreshSessions();
+        await refreshSessions();
       }
     } catch (err) {
       console.error("Execution failed:", err);
-    } finally {
-      setLoading(false);
     }
   };
 
@@ -136,6 +124,18 @@ export default function Chat() {
 
   return (
     <>
+      {currentSessionId && messages.length > 0 && (
+        <div className="chat-header glass">
+          <div className="topic-text">
+            <Bot size={18} className="topic-icon" />
+            {topic === "Generating title..." ? "Analyzing Intent..." : topic}
+          </div>
+          <div className="session-status">
+            {loading ? "Agent is reasoning..." : "Session Active"}
+          </div>
+        </div>
+      )}
+
       <div className="chat-container" ref={scrollRef}>
         {messages.length === 0 ? (
           <div className="greeting-container">
@@ -146,70 +146,13 @@ export default function Chat() {
           </div>
         ) : (
           messages.map((msg, idx) => (
-            <div key={idx} className={`message-wrapper ${msg.role}`}>
-              <div className={`message-bubble ${msg.role}`}>
-                <div className="message-header">
-                  {msg.role === 'user' ? 'You' : 'Koala'}
-                </div>
-                <div className="message-content">{msg.content}</div>
-                
-                {msg.subtasks && msg.subtasks.length > 0 && (
-                  <div className="orchestration-section">
-                    <button 
-                      className="details-toggle-btn"
-                      onClick={() => toggleDetails(idx)}
-                    >
-                      {expandedMessages[idx] ? 'Hide Orchestration Details' : 'Show Orchestration Details'}
-                    </button>
-                    
-                    {expandedMessages[idx] && (
-                      <div className="subtasks-container">
-                        <div className="subtasks-label">
-                          {msg.status === 'pending_approval' ? 'Proposed Execution Plan:' : 'Orchestration Workflow:'}
-                        </div>
-                        {msg.subtasks.map((task, tidx) => (
-                          <div key={tidx} className="subtask-card">
-                            <div className="subtask-card-header">
-                              <span className={`status-dot ${task.result ? 'done' : (msg.status === 'executing' ? 'active' : 'idle')}`}></span>
-                              <strong>Step {task.id}</strong> — <span className="model-tag">{task.assigned_model}</span>
-                            </div>
-                            <div className="subtask-desc">{task.description}</div>
-                            {task.result && (
-                              <div className="subtask-result">
-                                <div className="result-label">Result:</div>
-                                <div className="result-text">{task.result}</div>
-                              </div>
-                            )}
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                )}
-
-                {msg.role === 'assistant' && ['pending_approval', 'error'].includes(msg.status) && (
-                  <div className="plan-approval-actions">
-                    <button 
-                      className="execute-btn" 
-                      onClick={() => handleExecutePlan(idx)}
-                      disabled={loading}
-                    >
-                      {loading ? 'Wait...' : 'Confirm & Execute Orchestration'}
-                    </button>
-                    <div className="refine-tip">
-                      Or type your feedback below to refine this plan...
-                    </div>
-                  </div>
-                )}
-
-                {msg.status === 'executing' && (
-                  <div className="distributing-status">
-                    <div className="pulse-loader"></div>
-                    Agents are distributed and working on subtasks...
-                  </div>
-                )}
-              </div>
-            </div>
+            <MessageBubble 
+              key={idx} 
+              msg={msg} 
+              idx={idx} 
+              onExecute={handleExecutePlan} 
+              globalLoading={loading}
+            />
           ))
         )}
         

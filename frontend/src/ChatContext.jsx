@@ -9,8 +9,19 @@ export const ChatProvider = ({ children }) => {
   const { token } = useAuth();
   const navigate = useNavigate();
   const [sessions, setSessions] = useState([]);
-  const [currentSessionId, setCurrentSessionId] = useState(undefined); // undefined = initial, null = explicit new chat
+  const [currentSessionId, setCurrentSessionId] = useState(() => {
+    const saved = sessionStorage.getItem('koala_current_session_id');
+    // If we have a saved ID, we use it (even if it's the string "null")
+    // otherwise we use undefined to signal a fresh start
+    return saved !== null ? (saved === 'null' ? null : saved) : undefined;
+  });
   const [loadingSessions, setLoadingSessions] = useState(false);
+
+  useEffect(() => {
+    if (currentSessionId !== undefined) {
+      sessionStorage.setItem('koala_current_session_id', currentSessionId);
+    }
+  }, [currentSessionId]);
 
   const fetchSessions = useCallback(async () => {
     if (!token) return;
@@ -22,9 +33,9 @@ export const ChatProvider = ({ children }) => {
       if (res.ok) {
         const data = await res.json();
         setSessions(data);
-        // Default to first session if none set and not specifically in "New Chat" mode
-        if (data.length > 0 && currentSessionId === undefined) {
-          setCurrentSessionId(data[0].id);
+        // Start with a new session by default on initial load
+        if (currentSessionId === undefined) {
+          setCurrentSessionId(null);
         }
       }
     } catch (err) {

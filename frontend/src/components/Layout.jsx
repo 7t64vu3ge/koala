@@ -33,7 +33,13 @@ export default function Layout() {
           <button 
             onClick={createNewSession}
             className="btn btn-ghost" 
-            style={{justifyContent: 'flex-start', border: 'none', width: '100%', marginBottom: '0.5rem'}}
+            style={{
+              justifyContent: 'flex-start', 
+              border: 'none', 
+              width: '100%', 
+              marginBottom: '0.5rem',
+              backgroundColor: currentSessionId === null ? 'var(--bg-surface)' : 'transparent'
+            }}
           >
             <Plus size={18} /> New Chat
           </button>

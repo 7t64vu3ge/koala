@@ -1,10 +1,11 @@
 import os
 import json
-from typing import List, Literal, Dict, Any
+from typing import List, Literal, Dict, Any, TypedDict, Annotated
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, field_validator
 from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langgraph.graph import StateGraph, START, END
 
 # Load API keys
 load_dotenv()
@@ -57,6 +58,19 @@ class Subtask(BaseModel):
 class OrchestratorPlan(BaseModel):
     plan_summary: str = Field(description="A brief summary of the overall plan")
     subtasks: List[Subtask] = Field(description="The list of decomposed subtasks")
+
+
+# ── LangGraph State ──────────────────────────────────────────────────────────
+
+class OrchestrationState(TypedDict):
+    original_prompt: str
+    metadata: Dict[str, Any]
+    history: List[Dict[str, str]]
+    plan: OrchestratorPlan
+    completed_results: Dict[int, str]
+    next_subtask_id: Annotated[int, "The ID of the subtask to execute next"]
+    final_output: str
+    error: str
 
 
 # ── Planning ─────────────────────────────────────────────────────────────────
@@ -190,7 +204,7 @@ def refine_plan(original_prompt: str, current_plan: OrchestratorPlan, feedback: 
         return None
 
 
-# ── Execution ────────────────────────────────────────────────────────────────
+# ── Helper Functions ─────────────────────────────────────────────────────────
 
 def _build_context_prompt(subtask: Subtask, completed_results: Dict[int, str]) -> str:
     """Builds a rich prompt that includes results from dependency subtasks."""
@@ -208,112 +222,133 @@ def _build_context_prompt(subtask: Subtask, completed_results: Dict[int, str]) -
         )
     else:
         prompt = subtask.description
-
     return prompt
-
 
 def _execute_with_model(prompt: str, model: str) -> str:
     """Sends a prompt Using LangChain for cleaner subtask execution."""
     if not chat_model:
         return "⚠️  Chat model not configured."
-        
     try:
-        # Use simple invoke for raw text generation in execution steps
-        # This keeps the model instance shared for better rate limit handling
         response = chat_model.invoke([HumanMessage(content=prompt)])
         return response.content.strip()
     except Exception as e:
-        return f"❌ Execution error with {model}: {e}"
-
-
-def execute_plan(plan: OrchestratorPlan, progress_callback=None) -> Dict[int, str]:
-    """
-    Executes all subtasks in dependency order.
-    Returns a dict mapping subtask ID → agent response.
-    If progress_callback is provided, it is called with (subtask, status, optional_result)
-    where status is 'running' or 'completed'.
-    """
-    results: Dict[int, str] = {}
-    remaining = list(plan.subtasks)
-
-    print("\n" + "=" * 50)
-    print("🚀 EXECUTING PLAN")
-    print("=" * 50)
-
-    max_iterations = len(remaining) * len(remaining) + 1  # guard against circular deps
-    iteration = 0
-
-    while remaining and iteration < max_iterations:
-        iteration += 1
-        progress_made = False
-
-        for subtask in list(remaining):
-            # Check all dependencies are satisfied
-            if all((dep_id in results for dep_id in subtask.dependencies)):
-                print(f"\n▶ [{subtask.id}] 🤖 {subtask.assigned_model} | {subtask.description}")
-                print("   Working...")
-
-                if progress_callback:
-                    progress_callback(subtask, "running")
-
-                prompt = _build_context_prompt(subtask, results)
-                result = _execute_with_model(prompt, subtask.assigned_model)
-
-                results[subtask.id] = result
-                remaining.remove(subtask)
-                progress_made = True
-
-                print(f"   ✅ Done ({len(result)} chars)")
-
-                if progress_callback:
-                    progress_callback(subtask, "completed", result)
-
-        if not progress_made:
-            print("⚠️  Circular dependency detected — stopping execution.")
-            break
-
-    return results
-
+        return f"❌ Execution error: {e}"
 
 def merge_results(original_prompt: str, plan: OrchestratorPlan, execution_results: Dict[int, str]) -> str:
-    """Takes the original prompt, the generated plan, and all subtask results to produce a final cohesive output."""
+    """Synthesizes final output from all results."""
     if not chat_model:
         return "⚠️  Chat model not configured."
-        
-    print("\n" + "=" * 50)
-    print("🧠 MERGING RESULTS")
-    print("=" * 50)
-    print("   Synthesizing final output...")
-    
     context_parts = []
     for subtask in plan.subtasks:
         result = execution_results.get(subtask.id, "(no result)")
         context_parts.append(f"--- Subtask [{subtask.id}]: {subtask.description} ---\n{result}")
-        
     context_block = "\n\n".join(context_parts)
-    
     try:
         system_instruction = (
             "You are an expert AI Synthesizer. Your job is to read a user's original goal, "
             "the subtasks that were planned to achieve this goal, and the actual raw output from those subtasks. "
             "synthesize them naturally into a final polished artifact or answer."
         )
-        
         prompt_block = (
             f"USER'S ORIGINAL REQUEST: {original_prompt}\n\n"
             f"PLAN SUMMARY: {plan.plan_summary}\n\n"
             f"SUBTASK RESULTS:\n{context_block}\n\n"
             "Now, please synthesize the final response based on the above information."
         )
-
         response = chat_model.invoke([
             SystemMessage(content=system_instruction),
             HumanMessage(content=prompt_block)
         ])
         return response.content.strip()
     except Exception as e:
-        print(f"❌ Error during merge: {e}")
         return f"❌ Error during merge: {e}"
+
+# ── LangGraph Nodes ──────────────────────────────────────────────────────────
+
+def subtask_selector_node(state: OrchestrationState) -> Dict:
+    """Nodes that decides which subtask to run next based on dependencies."""
+    plan = state["plan"]
+    results = state["completed_results"]
+    
+    # Simple logic: find the first subtask that isn't done and whose deps are satisfied
+    for subtask in plan.subtasks:
+        if subtask.id not in results:
+            if all((dep_id in results for dep_id in subtask.dependencies)):
+                return {"next_subtask_id": subtask.id}
+    
+    # If no subtask can be run, we are either done or stuck
+    return {"next_subtask_id": -1}
+
+def executor_node(state: OrchestrationState) -> Dict:
+    """Executes the specific subtask identified by subtask_selector."""
+    subtask_id = state["next_subtask_id"]
+    if subtask_id == -1:
+        return {}
+        
+    plan = state["plan"]
+    results = state["completed_results"]
+    
+    # Find the subtask object
+    subtask = next((s for s in plan.subtasks if s.id == subtask_id), None)
+    if not subtask:
+        return {"error": f"Subtask #{subtask_id} not found in plan."}
+
+    print(f"\n▶ [{subtask.id}] 🤖 {subtask.assigned_model} | {subtask.description}")
+    
+    prompt = _build_context_prompt(subtask, results)
+    result = _execute_with_model(prompt, subtask.assigned_model)
+    
+    # Update results
+    new_results = results.copy()
+    new_results[subtask.id] = result
+    
+    return {"completed_results": new_results}
+
+def synthesizer_node(state: OrchestrationState) -> Dict:
+    """Merges all results into the final output."""
+    print("\n" + "=" * 50)
+    print("🧠 MERGING RESULTS (Graph Mode)")
+    print("=" * 50)
+    
+    final_response = merge_results(
+        state["original_prompt"],
+        state["plan"],
+        state["completed_results"]
+    )
+    return {"final_output": final_response}
+
+# ── Router Logic ─────────────────────────────────────────────────────────────
+
+def route_next_subtask(state: OrchestrationState) -> Literal["executor", "synthesizer", END]:
+    """Router that decides whether to continue execution or synthesize."""
+    if state.get("error"):
+        return END
+    
+    if state["next_subtask_id"] != -1:
+        return "executor"
+    else:
+        # All subtasks likely completed, verify
+        plan = state["plan"]
+        results = state["completed_results"]
+        if len(results) >= len(plan.subtasks):
+            return "synthesizer"
+        else:
+            return END # Stuck (circular dependency)
+
+# ── Graph Construction ───────────────────────────────────────────────────────
+
+builder = StateGraph(OrchestrationState)
+
+builder.add_node("selector", subtask_selector_node)
+builder.add_node("executor", executor_node)
+builder.add_node("synthesizer", synthesizer_node)
+
+builder.add_edge(START, "selector")
+builder.add_conditional_edges("selector", route_next_subtask)
+builder.add_edge("executor", "selector")
+builder.add_edge("synthesizer", END)
+
+orchestration_graph = builder.compile()
 
 
 # ── CLI Entry Point ──────────────────────────────────────────────────────────
@@ -354,23 +389,27 @@ def main():
             # Step 2: Ask whether to execute
             choice = input("\n⚡ Execute this plan now? [y/N]: ").strip().lower()
             if choice == "y":
-                results = execute_plan(plan)
+                # Execute using the Graph
+                initial_state = {
+                    "original_prompt": user_prompt,
+                    "metadata": {},
+                    "history": [],
+                    "plan": plan,
+                    "completed_results": {},
+                    "next_subtask_id": -1,
+                    "final_output": "",
+                    "error": ""
+                }
                 
-                final_output = merge_results(user_prompt, plan, results)
-
-                print("\n" + "=" * 50)
-                print("📦 FINAL SYNTHESIS")
-                print("=" * 50)
-                print(final_output)
+                final_state = orchestration_graph.invoke(initial_state)
                 
-                print("\n" + "=" * 50)
-                print("📋 SUBTASK LOGS")
-                print("=" * 50)
-                for task in plan.subtasks:
-                    result_text = results.get(task.id, "(not executed)")
-                    print(f"\n── Subtask [{task.id}]: {task.description}")
-                    print(result_text)
-                print("\n" + "=" * 50)
+                if final_state.get("error"):
+                    print(f"\n❌ Execution Failed: {final_state['error']}")
+                else:
+                    print("\n" + "=" * 50)
+                    print("📦 FINAL SYNTHESIS (Graph Generated)")
+                    print("=" * 50)
+                    print(final_state["final_output"])
             else:
                 print("ℹ️  Plan saved — tasks were NOT executed.")
 
