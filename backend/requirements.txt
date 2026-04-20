@@ -10,3 +10,4 @@ pyjwt
 email-validator
 langchain
 langchain-groq
+langgraph

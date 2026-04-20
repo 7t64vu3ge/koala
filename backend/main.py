@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from database import db
 from models import UserSignup, UserSignin, UserSettings, UserResponse, Token, MessageCreate, ChatSessionResponse
 from auth import get_password_hash, verify_password, create_access_token, get_current_user
-from orchestrator import plan_task, merge_results, generate_chat_title, refine_plan, OrchestratorPlan, orchestration_graph, OrchestrationState
+from orchestrator import plan_task, generate_chat_title, refine_plan, OrchestratorPlan, orchestration_graph, OrchestrationState
 from bson import ObjectId
 from datetime import datetime
 
