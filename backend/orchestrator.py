@@ -11,7 +11,6 @@ from langgraph.graph import StateGraph, START, END
 load_dotenv()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# ── LangChain Chat Model ───────────────────────
 chat_model = None
 if GROQ_API_KEY and "your_" not in GROQ_API_KEY:
     chat_model = ChatGroq(
@@ -21,8 +20,6 @@ if GROQ_API_KEY and "your_" not in GROQ_API_KEY:
         max_retries=2,
     )
 
-
-# ── Pydantic models ──────────────────────────────────────────────────────────
 
 class Subtask(BaseModel):
     id: int = Field(description="Unique ID for the subtask")
@@ -44,11 +41,11 @@ class Subtask(BaseModel):
     @field_validator("assigned_model", mode="before")
     @classmethod
     def map_deprecated_models(cls, v: Any) -> str:
-        # Robustly map hallucinations or deprecated models to the current free tier
+
         MAPPING = {
             "mixtral-8x7b-32768": "llama-3.1-70b-versatile",
             "llama-3.1-70b-instant": "llama-3.1-8b-instant",
-            "whisper-large-v3": "llama-3.3-70b-versatile", # Fallback for mis-assignments
+            "whisper-large-v3": "llama-3.3-70b-versatile",
             "whisper-large-v3-turbo": "llama-3.3-70b-versatile",
             "openai/gpt-oss-120b": "llama-3.3-70b-versatile",
             "openai/gpt-oss-20b": "llama-3.1-70b-versatile"
@@ -60,8 +57,6 @@ class OrchestratorPlan(BaseModel):
     subtasks: List[Subtask] = Field(description="The list of decomposed subtasks")
 
 
-# ── LangGraph State ──────────────────────────────────────────────────────────
-
 class OrchestrationState(TypedDict):
     original_prompt: str
     metadata: Dict[str, Any]
@@ -72,8 +67,6 @@ class OrchestrationState(TypedDict):
     final_output: str
     error: str
 
-
-# ── Planning ─────────────────────────────────────────────────────────────────
 
 def plan_task(prompt: str, history: List[Dict] = None, metadata: Dict = None) -> OrchestratorPlan | None:
     """Uses LangChain to decompose a prompt into a subtask plan with session context."""
@@ -130,7 +123,6 @@ Return the output as a structured JSON object according to the requested schema.
             SystemMessage(content=f"{system_instruction}\n\nYou MUST return a valid JSON object strictly matching this schema:\n{json.dumps(schema)}"),
         ]
         
-        # Convert raw history to LangChain messages
         for msg in (history or []):
             if msg["role"] == "user":
                 messages.append(HumanMessage(content=msg["content"]))
@@ -204,7 +196,6 @@ def refine_plan(original_prompt: str, current_plan: OrchestratorPlan, feedback: 
         return None
 
 
-# ── Helper Functions ─────────────────────────────────────────────────────────
 
 def _build_context_prompt(subtask: Subtask, completed_results: Dict[int, str]) -> str:
     """Builds a rich prompt that includes results from dependency subtasks."""
@@ -225,11 +216,17 @@ def _build_context_prompt(subtask: Subtask, completed_results: Dict[int, str]) -
     return prompt
 
 def _execute_with_model(prompt: str, model: str) -> str:
-    """Sends a prompt Using LangChain for cleaner subtask execution."""
-    if not chat_model:
+    """Sends a prompt to the assigned model for this subtask."""
+    if not GROQ_API_KEY:
         return "⚠️  Chat model not configured."
     try:
-        response = chat_model.invoke([HumanMessage(content=prompt)])
+        subtask_model = ChatGroq(
+            api_key=GROQ_API_KEY,
+            model_name=model,
+            temperature=0.7,
+            max_retries=2,
+        )
+        response = subtask_model.invoke([HumanMessage(content=prompt)])
         return response.content.strip()
     except Exception as e:
         return f"❌ Execution error: {e}"
@@ -263,20 +260,17 @@ def merge_results(original_prompt: str, plan: OrchestratorPlan, execution_result
     except Exception as e:
         return f"❌ Error during merge: {e}"
 
-# ── LangGraph Nodes ──────────────────────────────────────────────────────────
 
 def subtask_selector_node(state: OrchestrationState) -> Dict:
     """Nodes that decides which subtask to run next based on dependencies."""
     plan = state["plan"]
     results = state["completed_results"]
     
-    # Simple logic: find the first subtask that isn't done and whose deps are satisfied
     for subtask in plan.subtasks:
         if subtask.id not in results:
             if all((dep_id in results for dep_id in subtask.dependencies)):
                 return {"next_subtask_id": subtask.id}
     
-    # If no subtask can be run, we are either done or stuck
     return {"next_subtask_id": -1}
 
 def executor_node(state: OrchestrationState) -> Dict:
@@ -288,7 +282,6 @@ def executor_node(state: OrchestrationState) -> Dict:
     plan = state["plan"]
     results = state["completed_results"]
     
-    # Find the subtask object
     subtask = next((s for s in plan.subtasks if s.id == subtask_id), None)
     if not subtask:
         return {"error": f"Subtask #{subtask_id} not found in plan."}
@@ -298,7 +291,6 @@ def executor_node(state: OrchestrationState) -> Dict:
     prompt = _build_context_prompt(subtask, results)
     result = _execute_with_model(prompt, subtask.assigned_model)
     
-    # Update results
     new_results = results.copy()
     new_results[subtask.id] = result
     
@@ -317,7 +309,7 @@ def synthesizer_node(state: OrchestrationState) -> Dict:
     )
     return {"final_output": final_response}
 
-# ── Router Logic ─────────────────────────────────────────────────────────────
+
 
 def route_next_subtask(state: OrchestrationState) -> Literal["executor", "synthesizer", END]:
     """Router that decides whether to continue execution or synthesize."""
@@ -335,7 +327,6 @@ def route_next_subtask(state: OrchestrationState) -> Literal["executor", "synthe
         else:
             return END # Stuck (circular dependency)
 
-# ── Graph Construction ───────────────────────────────────────────────────────
 
 builder = StateGraph(OrchestrationState)
 
@@ -350,8 +341,6 @@ builder.add_edge("synthesizer", END)
 
 orchestration_graph = builder.compile()
 
-
-# ── CLI Entry Point ──────────────────────────────────────────────────────────
 
 def main():
     print("=" * 50)
