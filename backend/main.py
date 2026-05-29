@@ -1,11 +1,14 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from database import db
 from models import UserSignup, UserSignin, UserSettings, UserResponse, Token, MessageCreate, ChatSessionResponse
 from auth import get_password_hash, verify_password, create_access_token, get_current_user
-from orchestrator import plan_task, generate_chat_title, refine_plan, OrchestratorPlan, orchestration_graph, OrchestrationState
+from orchestrator import plan_task, generate_chat_title, refine_plan, validate_plan, merge_results, astream_merge_results, OrchestratorPlan, _execute_with_model_async
 from bson import ObjectId
 from datetime import datetime
+import asyncio
+import json
 
 app = FastAPI(
     title="Koala — AI Orchestrator API",
@@ -111,7 +114,15 @@ async def send_message(session_id: str, message: MessageCreate, current_user: di
         db_session_id = ObjectId(session_id)
         session = await db.chat_sessions.find_one({"_id": db_session_id, "user_id": current_user["id"]})
         if not session:
-            raise HTTPException(status_code=404, detail="Session not found")
+            # Debug: check if session exists at all (regardless of user_id)
+            orphan = await db.chat_sessions.find_one({"_id": db_session_id})
+            if orphan:
+                print(f"⚠️  Session {session_id} exists but user_id mismatch: "
+                      f"stored={orphan.get('user_id')!r} vs request={current_user['id']!r}")
+                raise HTTPException(status_code=403, detail="Not authorized to access this session")
+            else:
+                print(f"❌ Session {session_id} does not exist in the database at all.")
+                raise HTTPException(status_code=404, detail="Session not found")
 
     user_msg = {
         "role": "user", 
@@ -186,6 +197,10 @@ async def send_message(session_id: str, message: MessageCreate, current_user: di
 
     if not plan:
         raise HTTPException(status_code=500, detail="Failed to generate/refine plan.")
+
+    plan_errors = validate_plan(plan)
+    if plan_errors:
+        raise HTTPException(status_code=422, detail={"validation_errors": plan_errors})
         
     plan_dict = plan.model_dump()
     ai_msg = {
@@ -206,103 +221,148 @@ async def send_message(session_id: str, message: MessageCreate, current_user: di
         session_out["id"] = str(session_out.pop("_id"))
     return session_out
 
-@app.post("/chat/sessions/{session_id}/messages/{message_index}/execute")
-async def execute_confirmed_plan(session_id: str, message_index: int, current_user: dict = Depends(get_current_user)):
+async def _get_user_from_token_query(token: str = Query(...)):
+    """Auth dependency for SSE endpoint — reads token from query param since EventSource can't set headers."""
+    from auth import get_current_user
+    from fastapi.security import OAuth2PasswordBearer
+    # Reuse get_current_user by faking the dependency manually
+    import jwt
+    from auth import SECRET_KEY, ALGORITHM
+    from bson import ObjectId
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id = payload.get("sub")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Invalid token")
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    user = await db.users.find_one({"_id": ObjectId(user_id)})
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+    user["id"] = str(user.pop("_id"))
+    return user
+
+
+@app.get("/chat/sessions/{session_id}/messages/{message_index}/execute/stream")
+async def execute_confirmed_plan_stream(session_id: str, message_index: int, current_user: dict = Depends(_get_user_from_token_query)):
     db_session_id = ObjectId(session_id)
-    # Always pull the absolute latest state from DB
-    session = await db.chat_sessions.find_one({"_id": db_session_id, "user_id": current_user["id"]})
+    session = await db.chat_sessions.find_one({
+        "_id": db_session_id,
+        "user_id": current_user["id"]
+    })
     if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
-        
+        session = await db.chat_sessions.find_one({"_id": db_session_id})
+        if session and str(session.get("user_id")) != str(current_user["id"]):
+            raise HTTPException(status_code=403, detail="Not authorized to access this session")
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+
     messages = session.get("messages", [])
     if message_index >= len(messages):
-        raise HTTPException(status_code=400, detail=f"Invalid message index: {message_index}. Session has {len(messages)} messages.")
-        
+        raise HTTPException(status_code=400, detail=f"Invalid message index: {message_index}.")
+
     plan_msg = messages[message_index]
-    
-    # Debug info (will show in server logs)
-    print(f"Executing plan at index {message_index}. Role: {plan_msg.get('role')}, Status: {plan_msg.get('status')}")
-    
     if plan_msg.get("role") != "assistant":
-        raise HTTPException(status_code=400, detail=f"Message at index {message_index} is not an assistant message (role is {plan_msg.get('role')}).")
-        
-    # Allow retrying if the status is pending_approval OR error
+        raise HTTPException(status_code=400, detail="Target message is not an assistant message.")
     if plan_msg.get("status") not in ["pending_approval", "error"] or not plan_msg.get("plan"):
-        raise HTTPException(status_code=400, detail=f"Message at index {message_index} cannot be executed (status is {plan_msg.get('status')}).")
-    
-    # Mark as executing in the DB
+        raise HTTPException(status_code=400, detail=f"Message cannot be executed (status: {plan_msg.get('status')}).")
+
+    plan = OrchestratorPlan(**plan_msg["plan"])
+    original_prompt = ""
+    for i in range(message_index - 1, -1, -1):
+        if messages[i]["role"] == "user":
+            original_prompt = messages[i]["content"]
+            break
+
     await db.chat_sessions.update_one(
         {"_id": db_session_id},
         {"$set": {f"messages.{message_index}.status": "executing"}}
     )
-    
-    try:
-        # Re-fetch or use the plan metadata
-        plan_data = plan_msg["plan"]
-        plan = OrchestratorPlan(**plan_data)
-        
-        # Find the user prompt that triggered this plan
-        original_prompt = ""
-        for i in range(message_index - 1, -1, -1):
-            if messages[i]["role"] == "user":
-                original_prompt = messages[i]["content"]
-                break
-        
-        # Build history for context-aware synthesis
-        history = []
-        for m in session.get("messages", [])[:message_index]:
-            if m.get("status") == "completed":
-                history.append({"role": m["role"], "content": m["content"]})
 
-        print(f"🚀 Graph Execution started for prompt: {original_prompt[:50]}...")
-        
-        # Initialize Graph State
-        initial_state = {
-            "original_prompt": original_prompt,
-            "metadata": session.get("metadata", {}),
-            "history": history, # History built in send_message, but let's just use current session logic
-            "plan": plan,
-            "completed_results": {},
-            "next_subtask_id": -1,
-            "final_output": "",
-            "error": ""
-        }
-        
-        # Execute the Graph
-        final_state = orchestration_graph.invoke(initial_state)
-        
-        if final_state.get("error"):
-            raise Exception(final_state["error"])
+    async def event_stream():
+        def sse(event: str, data: dict) -> str:
+            return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+        completed_results: dict = {}
+        all_subtasks = {s.id: s for s in plan.subtasks}
+        remaining = set(all_subtasks.keys())
+
+        try:
+            while remaining:
+                ready = [
+                    all_subtasks[sid] for sid in remaining
+                    if all(dep in completed_results for dep in all_subtasks[sid].dependencies)
+                ]
+                if not ready:
+                    break  # circular dep — already caught by validate_plan
+
+                # Emit started for every subtask in this wave
+                for s in ready:
+                    yield sse("subtask_started", {"id": s.id})
+                    await db.chat_sessions.update_one(
+                        {"_id": db_session_id},
+                        {"$set": {f"messages.{message_index}.subtasks.{s.id - 1}.status": "running"}}
+                    )
+
+                # Execute wave concurrently
+                wave_results = await asyncio.gather(
+                    *[_execute_with_model_async(s, completed_results) for s in ready]
+                )
+
+                for subtask_id, result in wave_results:
+                    completed_results[subtask_id] = result
+                    remaining.discard(subtask_id)
+                    # Persist result into the subtask array in MongoDB
+                    subtask_index = next(i for i, st in enumerate(plan_msg["subtasks"]) if st["id"] == subtask_id)
+                    await db.chat_sessions.update_one(
+                        {"_id": db_session_id},
+                        {"$set": {
+                            f"messages.{message_index}.subtasks.{subtask_index}.result": result,
+                            f"messages.{message_index}.subtasks.{subtask_index}.status": "done"
+                        }}
+                    )
+                    yield sse("subtask_done", {"id": subtask_id, "result": result})
+
+            # Stream synthesis final output token-by-token
+            yield sse("synthesis_started", {})
             
-        results = final_state["completed_results"]
-        final_output = final_state["final_output"]
-        
-        # Update subtasks with results for UI feedback
-        updated_subtasks = plan_msg["subtasks"]
-        for st in updated_subtasks:
-            st["result"] = results.get(st["id"], "(not executed)")
+            final_output_chunks = []
+            async for chunk in astream_merge_results(original_prompt, plan, completed_results):
+                final_output_chunks.append(chunk)
+                yield sse("token", {"text": chunk})
+                await asyncio.sleep(0.04)  # Throttle tokens for readable typing cadence
             
-        # Atomically update the message to completed
-        await db.chat_sessions.update_one(
-            {"_id": db_session_id},
-            {"$set": {
-                f"messages.{message_index}.status": "completed",
-                f"messages.{message_index}.content": final_output,
-                f"messages.{message_index}.subtasks": updated_subtasks
-            }}
-        )
-    except Exception as e:
-        import traceback
-        error_detail = traceback.format_exc()
-        print(f"❌ CRITICAL EXECUTION FAILURE at index {message_index}:\n{error_detail}")
-        await db.chat_sessions.update_one(
-            {"_id": db_session_id},
-            {"$set": {f"messages.{message_index}.status": "error", f"messages.{message_index}.content": f"Execution failed: {str(e)}"}}
-        )
-        raise HTTPException(status_code=500, detail=f"Execution failed: {str(e)}")
-        
-    # Return the fully updated session
-    session_out = await db.chat_sessions.find_one({"_id": db_session_id})
-    if session_out:
-        session_out["id"] = str(session_out.pop("_id"))
-    return session_out
+            final_output = "".join(final_output_chunks)
+            await db.chat_sessions.update_one(
+                {"_id": db_session_id},
+                {"$set": {
+                    f"messages.{message_index}.status": "completed",
+                    f"messages.{message_index}.content": final_output,
+                }}
+            )
+            yield sse("complete", {"final_output": final_output})
+
+        except asyncio.CancelledError:
+            print(f"🔌 Client disconnected. Stopping execution of session {session_id} message {message_index}.")
+            # Set the message status to error/stopped so the UI updates accordingly and subsequent requests are clean
+            await db.chat_sessions.update_one(
+                {"_id": db_session_id},
+                {"$set": {
+                    f"messages.{message_index}.status": "error",
+                    f"messages.{message_index}.content": "Execution stopped by user."
+                }}
+            )
+            raise
+        except Exception as e:
+            import traceback
+            print(f"❌ SSE execution error:\n{traceback.format_exc()}")
+            await db.chat_sessions.update_one(
+                {"_id": db_session_id},
+                {"$set": {
+                    f"messages.{message_index}.status": "error",
+                    f"messages.{message_index}.content": f"Execution failed: {str(e)}"
+                }}
+            )
+            yield sse("error", {"detail": str(e)})
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})

@@ -37,6 +37,13 @@ export const ChatProvider = ({ children }) => {
         if (currentSessionId === undefined) {
           setCurrentSessionId(null);
         }
+        // Validate: if the persisted session ID no longer exists in the
+        // database (e.g. DB was reset, session was deleted), reset to new chat
+        // so we don't send requests to a non-existent session.
+        else if (currentSessionId && !data.some(s => s.id === currentSessionId)) {
+          console.warn(`Stale session ID "${currentSessionId}" not found in fetched sessions — resetting to new chat.`);
+          setCurrentSessionId(null);
+        }
       }
     } catch (err) {
       console.error('Failed to fetch sessions:', err);
@@ -62,11 +69,7 @@ export const ChatProvider = ({ children }) => {
         headers: { 'Authorization': `Bearer ${token}` }
       });
       if (res.ok) {
-        const newSession = await res.json();
-        // We only set the current ID to "new", we NOT add it to the sessions list 
-        // because it doesn't have messages yet.
-        setCurrentSessionId(newSession.id);
-        return newSession;
+        return await res.json(); // returns { id: "new" }, caller sets the real ID
       }
     } catch (err) {
       console.error('Failed to persist session:', err);

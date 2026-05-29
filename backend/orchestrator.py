@@ -1,6 +1,7 @@
 import os
 import json
-from typing import List, Literal, Dict, Any, TypedDict, Annotated
+import asyncio
+from typing import List, Literal, Dict, Any, TypedDict
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, field_validator
 from langchain_groq import ChatGroq
@@ -15,7 +16,7 @@ chat_model = None
 if GROQ_API_KEY and "your_" not in GROQ_API_KEY:
     chat_model = ChatGroq(
         api_key=GROQ_API_KEY,
-        model_name="llama-3.3-70b-versatile", # default model
+        model_name="llama-3.3-70b-versatile",
         temperature=0.7,
         max_retries=2,
     )
@@ -27,14 +28,21 @@ class Subtask(BaseModel):
     assigned_model: Literal[
         "llama-3.1-8b-instant",
         "llama-3.3-70b-versatile",
-        "llama-3.1-70b-versatile",
-        "distil-whisper-large-v3-en"
+        "openai/gpt-oss-120b",
+        "openai/gpt-oss-20b",
+        "qwen/qwen3-32b",
+        "meta-llama/llama-4-scout-17b-16e-instruct",
+        "whisper-large-v3",
+        "whisper-large-v3-turbo"
     ] = Field(
-        description="Assigned free AI model for this task. "
+        description="Assigned model for this task. "
                     "Use 'llama-3.3-70b-versatile' for complex logical reasoning and coding. "
-                    "Use 'llama-3.1-8b-instant' for fast, simple feedback or translations. "
-                    "Use 'llama-3.1-70b-versatile' for alternative high-context reasoning. "
-                    "Use 'distil-whisper-large-v3-en' only if audio transcription processing conceptually applies."
+                    "Use 'llama-3.1-8b-instant' for fast, simple or translation tasks. "
+                    "Use 'openai/gpt-oss-120b' for the most demanding reasoning or long-context tasks. "
+                    "Use 'openai/gpt-oss-20b' for balanced quality and speed. "
+                    "Use 'qwen/qwen3-32b' for multilingual or alternative high-context reasoning. "
+                    "Use 'meta-llama/llama-4-scout-17b-16e-instruct' for instruction-following and agentic tasks. "
+                    "Use 'whisper-large-v3' or 'whisper-large-v3-turbo' only for audio transcription tasks."
     )
     dependencies: List[int] = Field(description="List of IDs of subtasks that must be completed before this one")
 
@@ -43,12 +51,10 @@ class Subtask(BaseModel):
     def map_deprecated_models(cls, v: Any) -> str:
 
         MAPPING = {
-            "mixtral-8x7b-32768": "llama-3.1-70b-versatile",
+            "mixtral-8x7b-32768": "qwen/qwen3-32b",
+            "llama-3.1-70b-versatile": "openai/gpt-oss-20b",
             "llama-3.1-70b-instant": "llama-3.1-8b-instant",
-            "whisper-large-v3": "llama-3.3-70b-versatile",
-            "whisper-large-v3-turbo": "llama-3.3-70b-versatile",
-            "openai/gpt-oss-120b": "llama-3.3-70b-versatile",
-            "openai/gpt-oss-20b": "llama-3.1-70b-versatile"
+            "distil-whisper-large-v3-en": "whisper-large-v3-turbo",
         }
         return MAPPING.get(v, v)
 
@@ -57,13 +63,47 @@ class OrchestratorPlan(BaseModel):
     subtasks: List[Subtask] = Field(description="The list of decomposed subtasks")
 
 
+def validate_plan(plan: OrchestratorPlan) -> List[str]:
+    """Topological-sort check: returns a list of error strings, empty means valid."""
+    errors = []
+    ids = {s.id for s in plan.subtasks}
+
+    # Check for dangling dependency references
+    for subtask in plan.subtasks:
+        for dep_id in subtask.dependencies:
+            if dep_id not in ids:
+                errors.append(f"Subtask #{subtask.id} depends on #{dep_id} which does not exist.")
+
+    # Kahn's algorithm to detect cycles
+    in_degree = {s.id: 0 for s in plan.subtasks}
+    for subtask in plan.subtasks:
+        for dep_id in subtask.dependencies:
+            if dep_id in in_degree:
+                in_degree[subtask.id] += 1
+
+    queue = [sid for sid, deg in in_degree.items() if deg == 0]
+    visited = 0
+    while queue:
+        node = queue.pop()
+        visited += 1
+        for subtask in plan.subtasks:
+            if node in subtask.dependencies:
+                in_degree[subtask.id] -= 1
+                if in_degree[subtask.id] == 0:
+                    queue.append(subtask.id)
+
+    if visited < len(plan.subtasks):
+        errors.append("Plan contains a circular dependency and cannot be executed.")
+
+    return errors
+
+
 class OrchestrationState(TypedDict):
     original_prompt: str
     metadata: Dict[str, Any]
     history: List[Dict[str, str]]
     plan: OrchestratorPlan
     completed_results: Dict[int, str]
-    next_subtask_id: Annotated[int, "The ID of the subtask to execute next"]
     final_output: str
     error: str
 
@@ -71,7 +111,7 @@ class OrchestrationState(TypedDict):
 def plan_task(prompt: str, history: List[Dict] = None, metadata: Dict = None) -> OrchestratorPlan | None:
     """Uses LangChain to decompose a prompt into a subtask plan with session context."""
     if not chat_model:
-        print("⚠️  Chat model not configured.")
+        print("Chat model not configured.")
         return None
 
     metadata = metadata or {}
@@ -86,12 +126,16 @@ def plan_task(prompt: str, history: List[Dict] = None, metadata: Dict = None) ->
 
 For each subtask:
 1. Clearly describe the task.
-2. Assign the most appropriate free AI model from the available options (STRICTLY USE ONLY THESE IDs):
-   - 'llama-3.3-70b-versatile': Best for complex logic, multi-step reasoning, and deep coding.
-   - 'llama-3.1-8b-instant', 'llama-3.1-70b-versatile': Good for general tasks and context-heavy logic.
-   - 'distil-whisper-large-v3-en': For audio-related tasks.
+2. Assign the most appropriate model from the available options (STRICTLY USE ONLY THESE IDs):
+   - 'llama-3.3-70b-versatile': Complex logic, multi-step reasoning, coding.
+   - 'llama-3.1-8b-instant': Fast, simple tasks, translations.
+   - 'openai/gpt-oss-120b': Most demanding reasoning or very long-context tasks.
+   - 'openai/gpt-oss-20b': Balanced quality and speed.
+   - 'qwen/qwen3-32b': Multilingual or alternative high-context reasoning.
+   - 'meta-llama/llama-4-scout-17b-16e-instruct': Instruction-following and agentic tasks.
+   - 'whisper-large-v3' or 'whisper-large-v3-turbo': Audio transcription only.
 
-   DO NOT use deprecated models like 'mixtral-8x7b-32768'.
+   DO NOT use deprecated models like 'mixtral-8x7b-32768', 'llama-3.1-70b-versatile', or 'distil-whisper-large-v3-en'.
 
 3. Provide a detailed evaluation including:
    - Why this model is selected over others
@@ -134,7 +178,7 @@ Return the output as a structured JSON object according to the requested schema.
         response = chat_model.with_structured_output(OrchestratorPlan).invoke(messages)
         return response
     except Exception as e:
-        print(f"❌ Error during orchestration: {e}")
+        print(f"Error during orchestration: {e}")
         return None
 
 
@@ -152,7 +196,7 @@ def generate_chat_title(prompt: str) -> str:
         ])
         return response.content.strip().strip('"').strip("'")
     except Exception as e:
-        print(f"❌ Error generating title: {e}")
+        print(f"Error generating title: {e}")
         return "New Chat"
 
 
@@ -192,7 +236,7 @@ def refine_plan(original_prompt: str, current_plan: OrchestratorPlan, feedback: 
         response = chat_model.with_structured_output(OrchestratorPlan).invoke(messages)
         return response
     except Exception as e:
-        print(f"❌ Error during plan refinement: {e}")
+        print(f"Error during plan refinement: {e}")
         return None
 
 
@@ -215,26 +259,27 @@ def _build_context_prompt(subtask: Subtask, completed_results: Dict[int, str]) -
         prompt = subtask.description
     return prompt
 
-def _execute_with_model(prompt: str, model: str) -> str:
-    """Sends a prompt to the assigned model for this subtask."""
+async def _execute_with_model_async(subtask: Subtask, completed_results: Dict[int, str]) -> tuple[int, str]:
+    """Async execution of a single subtask against its assigned model."""
     if not GROQ_API_KEY:
-        return "⚠️  Chat model not configured."
+        return subtask.id, "Chat model not configured."
     try:
         subtask_model = ChatGroq(
             api_key=GROQ_API_KEY,
-            model_name=model,
+            model_name=subtask.assigned_model,
             temperature=0.7,
             max_retries=2,
         )
-        response = subtask_model.invoke([HumanMessage(content=prompt)])
-        return response.content.strip()
+        prompt = _build_context_prompt(subtask, completed_results)
+        response = await subtask_model.ainvoke([HumanMessage(content=prompt)])
+        return subtask.id, response.content.strip()
     except Exception as e:
-        return f"❌ Execution error: {e}"
+        return subtask.id, f"Execution error: {e}"
 
 def merge_results(original_prompt: str, plan: OrchestratorPlan, execution_results: Dict[int, str]) -> str:
     """Synthesizes final output from all results."""
     if not chat_model:
-        return "⚠️  Chat model not configured."
+        return "Chat model not configured."
     context_parts = []
     for subtask in plan.subtasks:
         result = execution_results.get(subtask.id, "(no result)")
@@ -258,48 +303,70 @@ def merge_results(original_prompt: str, plan: OrchestratorPlan, execution_result
         ])
         return response.content.strip()
     except Exception as e:
-        return f"❌ Error during merge: {e}"
+        return f"Error during merge: {e}"
 
 
-def subtask_selector_node(state: OrchestrationState) -> Dict:
-    """Nodes that decides which subtask to run next based on dependencies."""
-    plan = state["plan"]
-    results = state["completed_results"]
-    
+async def astream_merge_results(original_prompt: str, plan: OrchestratorPlan, execution_results: Dict[int, str]):
+    """Synthesizes final output from all results and streams the tokens in real time."""
+    if not chat_model:
+        yield "Chat model not configured."
+        return
+    context_parts = []
     for subtask in plan.subtasks:
-        if subtask.id not in results:
-            if all((dep_id in results for dep_id in subtask.dependencies)):
-                return {"next_subtask_id": subtask.id}
-    
-    return {"next_subtask_id": -1}
+        result = execution_results.get(subtask.id, "(no result)")
+        context_parts.append(f"--- Subtask [{subtask.id}]: {subtask.description} ---\n{result}")
+    context_block = "\n\n".join(context_parts)
+    try:
+        system_instruction = (
+            "You are an expert AI Synthesizer. Your job is to read a user's original goal, "
+            "the subtasks that were planned to achieve this goal, and the actual raw output from those subtasks. "
+            "synthesize them naturally into a final polished artifact or answer."
+        )
+        prompt_block = (
+            f"USER'S ORIGINAL REQUEST: {original_prompt}\n\n"
+            f"PLAN SUMMARY: {plan.plan_summary}\n\n"
+            f"SUBTASK RESULTS:\n{context_block}\n\n"
+            "Now, please synthesize the final response based on the above information."
+        )
+        async for chunk in chat_model.astream([
+            SystemMessage(content=system_instruction),
+            HumanMessage(content=prompt_block)
+        ]):
+            if chunk.content:
+                yield chunk.content
+    except Exception as e:
+        yield f"Error during merge: {e}"
 
-def executor_node(state: OrchestrationState) -> Dict:
-    """Executes the specific subtask identified by subtask_selector."""
-    subtask_id = state["next_subtask_id"]
-    if subtask_id == -1:
-        return {}
-        
+
+async def parallel_executor_node(state: OrchestrationState) -> Dict:
+    """Collects all ready subtasks in this wave and executes them concurrently."""
     plan = state["plan"]
     results = state["completed_results"]
-    
-    subtask = next((s for s in plan.subtasks if s.id == subtask_id), None)
-    if not subtask:
-        return {"error": f"Subtask #{subtask_id} not found in plan."}
 
-    print(f"\n▶ [{subtask.id}] 🤖 {subtask.assigned_model} | {subtask.description}")
-    
-    prompt = _build_context_prompt(subtask, results)
-    result = _execute_with_model(prompt, subtask.assigned_model)
-    
+    ready = [
+        s for s in plan.subtasks
+        if s.id not in results and all(dep in results for dep in s.dependencies)
+    ]
+
+    if not ready:
+        return {}
+
+    print(f"\n Parallel wave: {[s.id for s in ready]}")
+    for s in ready:
+        print(f"[{s.id}] 🤖 {s.assigned_model} | {s.description}")
+
+    wave_results = await asyncio.gather(*[_execute_with_model_async(s, results) for s in ready])
+
     new_results = results.copy()
-    new_results[subtask.id] = result
-    
+    for subtask_id, result in wave_results:
+        new_results[subtask_id] = result
+
     return {"completed_results": new_results}
 
 def synthesizer_node(state: OrchestrationState) -> Dict:
     """Merges all results into the final output."""
     print("\n" + "=" * 50)
-    print("🧠 MERGING RESULTS (Graph Mode)")
+    print("MERGING RESULTS (Graph Mode)")
     print("=" * 50)
     
     final_response = merge_results(
@@ -311,32 +378,28 @@ def synthesizer_node(state: OrchestrationState) -> Dict:
 
 
 
-def route_next_subtask(state: OrchestrationState) -> Literal["executor", "synthesizer", END]:
-    """Router that decides whether to continue execution or synthesize."""
+def route_after_wave(state: OrchestrationState) -> Literal["parallel_executor", "synthesizer", END]:
+    """Routes to another wave, synthesizer, or END (stuck = circular dep caught by validate_plan)."""
     if state.get("error"):
         return END
-    
-    if state["next_subtask_id"] != -1:
-        return "executor"
-    else:
-        # All subtasks likely completed, verify
-        plan = state["plan"]
-        results = state["completed_results"]
-        if len(results) >= len(plan.subtasks):
-            return "synthesizer"
-        else:
-            return END # Stuck (circular dependency)
+    plan = state["plan"]
+    results = state["completed_results"]
+    if len(results) >= len(plan.subtasks):
+        return "synthesizer"
+    has_ready = any(
+        s.id not in results and all(dep in results for dep in s.dependencies)
+        for s in plan.subtasks
+    )
+    return "parallel_executor" if has_ready else END
 
 
 builder = StateGraph(OrchestrationState)
 
-builder.add_node("selector", subtask_selector_node)
-builder.add_node("executor", executor_node)
+builder.add_node("parallel_executor", parallel_executor_node)
 builder.add_node("synthesizer", synthesizer_node)
 
-builder.add_edge(START, "selector")
-builder.add_conditional_edges("selector", route_next_subtask)
-builder.add_edge("executor", "selector")
+builder.add_edge(START, "parallel_executor")
+builder.add_conditional_edges("parallel_executor", route_after_wave)
 builder.add_edge("synthesizer", END)
 
 orchestration_graph = builder.compile()
@@ -344,17 +407,17 @@ orchestration_graph = builder.compile()
 
 def main():
     print("=" * 50)
-    print("  🐨 Koala — Terminal AI Orchestrator")
+    print("Koala — Terminal AI Orchestrator")
     print("=" * 50)
     print("Breaks down complex tasks and executes them via specialized AI models.\n")
-    print(f"  Planner & Executor Client: {'✅ ready' if chat_model else '❌ not configured'}")
+    print(f"  Planner & Executor Client: {'ready' if chat_model else 'not configured'}")
     print()
 
     while True:
         try:
             user_prompt = input("\nEnter your prompt (or type 'exit' to quit):\n> ")
             if user_prompt.lower() in ["exit", "quit"]:
-                print("Goodbye! 👋")
+                print("Goodbye!")
                 break
 
             if not user_prompt.strip():
@@ -363,6 +426,14 @@ def main():
             # Step 1: Plan
             plan = plan_task(user_prompt)
             if not plan:
+                continue
+
+            # Step 1b: Validate plan before offering execution
+            plan_errors = validate_plan(plan)
+            if plan_errors:
+                print("\n Plan validation failed — cannot execute:")
+                for err in plan_errors:
+                    print(f"   • {err}")
                 continue
 
             print("\n" + "=" * 50)
@@ -376,7 +447,7 @@ def main():
             print("=" * 50)
 
             # Step 2: Ask whether to execute
-            choice = input("\n⚡ Execute this plan now? [y/N]: ").strip().lower()
+            choice = input("\nExecute this plan now? [y/N]: ").strip().lower()
             if choice == "y":
                 # Execute using the Graph
                 initial_state = {
@@ -385,7 +456,6 @@ def main():
                     "history": [],
                     "plan": plan,
                     "completed_results": {},
-                    "next_subtask_id": -1,
                     "final_output": "",
                     "error": ""
                 }
@@ -393,17 +463,17 @@ def main():
                 final_state = orchestration_graph.invoke(initial_state)
                 
                 if final_state.get("error"):
-                    print(f"\n❌ Execution Failed: {final_state['error']}")
+                    print(f"\nExecution Failed: {final_state['error']}")
                 else:
                     print("\n" + "=" * 50)
-                    print("📦 FINAL SYNTHESIS (Graph Generated)")
+                    print("FINAL SYNTHESIS (Graph Generated)")
                     print("=" * 50)
                     print(final_state["final_output"])
             else:
-                print("ℹ️  Plan saved — tasks were NOT executed.")
+                print("Plan saved — tasks were NOT executed.")
 
         except KeyboardInterrupt:
-            print("\nGoodbye! 👋")
+            print("\nGoodbye!")
             break
 
 
