@@ -26,7 +26,7 @@ app.add_middleware(
 
 @app.get("/")
 def read_root():
-    return {"message": "🐨 Koala AI Orchestrator Backend is running."}
+    return {"message": "Koala AI Orchestrator Backend is running."}
 
 # --- AUTH ROUTES ---
 @app.post("/auth/signup", response_model=UserResponse)
